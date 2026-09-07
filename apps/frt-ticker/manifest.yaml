@@ -1,0 +1,9 @@
+name: FRT Ticker
+author: robynhub
+description: Live Internet routing statistics including IPv4/IPv6 prefixes, FRT size, RPKI status, AS-path length, top origin ASes, and IPv6 adoption.
+tags:
+  - network
+  - internet
+  - bgp
+  - info
+preview: ./preview.gif
