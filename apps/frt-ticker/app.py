@@ -200,6 +200,7 @@ def native_text(value, x, y, *, font="small", color=C_WHITE, align="top_left",
                 width=None, scroll_rate=None, scroll_start_delay=None,
                 scroll_repeat_delay=None):
     d = {
+	"id": "native_text",
         "type": "text",
         "text": str(value),
         "x": x,
