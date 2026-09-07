@@ -1,0 +1,410 @@
+"""BUSY dial -> existing Codex Desktop or connected CLI settings (no new turns).
+
+Desktop IPC is private/versioned. Fail closed if its owner or snapshot protocol
+changes. Never resume a task, edit config.toml, or send a prompt as a fallback.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import os
+from pathlib import Path
+import select
+import socket
+import stat
+import struct
+import threading
+import time
+import uuid
+
+from effort_animation import DURATION_S
+
+LEVELS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+STATE_KEYS = {'latestThreadSettings', 'latestModel', 'latestReasoningEffort',
+              'latestCollaborationMode'}
+MAX_FRAME = 256 * 1024 * 1024
+CATALOG_GRACE_S = 300
+STEP_INTERVAL_S = .04
+
+
+class CatalogError(ValueError):
+    """A local catalog problem does not mean the Desktop connection failed."""
+
+
+class ModelCatalog:
+    def __init__(self, home, clock=time.monotonic):
+        self.path = Path(home) / 'models_cache.json'
+        self.clock = clock
+        self.known = {}
+        self.current = {}
+        self.read_error = ''
+        self.refresh()  # Warm before the first dial event, including every model.
+
+    def refresh(self):
+        try:
+            data = json.loads(self.path.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get('models'), list):
+                raise ValueError('models must be an array')
+            current = {}
+            for entry in data['models']:
+                if not isinstance(entry, dict) or not isinstance(entry.get('slug'), str):
+                    continue
+                supported = {r.get('effort') for r in entry.get('supported_reasoning_levels', [])
+                             if isinstance(r, dict)}
+                current[entry['slug']] = [level for level in LEVELS if level in supported]
+            self.current = current
+            now = self.clock()
+            for model, levels in current.items():
+                self.known[model] = (levels, now)
+            self.read_error = ''
+        except (OSError, ValueError, TypeError) as error:
+            self.current = {}
+            self.read_error = type(error).__name__
+
+    def levels_for(self, model):
+        self.refresh()
+        if model in self.current:
+            levels = self.current[model]
+        else:
+            levels, seen_at = self.known.get(model, (None, float('-inf')))
+            if levels is None or self.clock() - seen_at > CATALOG_GRACE_S:
+                reason = self.read_error or 'model absent'
+                raise CatalogError(f'Codex catalog unavailable for model={model!r}: {reason}; '
+                                   f'catalog_models={",".join(self.current)}')
+        if not levels:
+            raise CatalogError(f'No supported effort levels for model={model!r}')
+        return list(levels)
+
+
+def supported_efforts(model, home):
+    return ModelCatalog(home).levels_for(model)
+
+
+def model_effort(state):
+    settings = state.get('latestThreadSettings') or {}
+    collab = settings.get('collaborationMode') or state.get('latestCollaborationMode') or {}
+    mode_settings = collab.get('settings') or {}
+    return (settings.get('model') or state.get('latestModel'),
+            mode_settings.get('reasoning_effort') or settings.get('effort')
+            or state.get('latestReasoningEffort'))
+
+
+def effort_settings(state, effort):
+    result = {'effort': effort}
+    collab = ((state.get('latestThreadSettings') or {}).get('collaborationMode')
+              or state.get('latestCollaborationMode'))
+    if collab:
+        result['collaborationMode'] = copy.deepcopy(collab)
+        result['collaborationMode']['settings']['reasoning_effort'] = effort
+    return result
+
+
+def apply_change(state, revision, change):
+    if change['type'] == 'snapshot':
+        return ({k: copy.deepcopy(v) for k, v in change['conversationState'].items()
+                 if k in STATE_KEYS}, change['revision'])
+    if change['type'] != 'patches' or change['baseRevision'] != revision:
+        raise ValueError('Codex snapshot revision mismatch')
+    state = copy.deepcopy(state)
+    for patch in change['patches']:
+        path = patch['path']
+        if not isinstance(path, list):
+            raise ValueError('Unsupported Codex patch format')
+        if not path or path[0] not in STATE_KEYS:
+            continue
+        parent = state
+        for key in path[:-1]:
+            parent = parent[key]
+        if patch['op'] == 'remove':
+            parent.pop(path[-1], None)
+        elif patch['op'] in ('add', 'replace'):
+            parent[path[-1]] = copy.deepcopy(patch['value'])
+        else:
+            raise ValueError('Unsupported Codex patch operation')
+    return state, change['revision']
+
+
+class DesktopIPC:
+    def __init__(self, path, on_change):
+        self.path = Path(path)
+        self.on_change = on_change
+        self.sock = None
+        self.client_id = None
+        self.thread_id = None
+        self.owner = None
+
+    def connect(self, thread_id):
+        info = self.path.stat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError('Codex IPC socket is not owned by this user')
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(3)
+        self.sock.connect(str(self.path))
+        self.client_id = self.request('initialize', {'clientType': 'busybar'})['result']['clientId']
+        self.thread_id = thread_id
+        response = self.request('thread-owner-discovery',
+                                {'hostId': 'local', 'conversationId': thread_id})
+        self.owner = response['handledByClientId']
+        self.send({'type': 'broadcast', 'method': 'thread-stream-following-changed',
+                   'version': 1, 'sourceClientId': self.client_id,
+                   'targetClientIds': [self.owner],
+                   'params': {'hostId': 'local', 'conversationId': thread_id, 'following': True}})
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+    def send(self, message):
+        data = json.dumps(message).encode()
+        self.sock.sendall(struct.pack('<I', len(data)) + data)
+
+    def receive(self):
+        def exact(length):
+            data = bytearray()
+            while len(data) < length:
+                part = self.sock.recv(length - len(data))
+                if not part:
+                    raise ConnectionError('Codex Desktop disconnected')
+                data.extend(part)
+            return data
+        size = struct.unpack('<I', exact(4))[0]
+        if not 0 < size <= MAX_FRAME:
+            raise ValueError('Invalid Codex IPC frame length')
+        message = json.loads(exact(size))
+        if message['type'] == 'client-discovery-request':
+            self.send({'type': 'client-discovery-response', 'requestId': message['requestId'],
+                       'response': {'canHandle': False}})
+        if message.get('method') == 'thread-stream-state-changed':
+            params = message['params']
+            if (params.get('conversationId') == self.thread_id
+                    and params.get('hostId') == 'local'
+                    and message.get('sourceClientId') == self.owner):
+                if message.get('version') != 11:
+                    raise ValueError('Unsupported Codex Desktop snapshot protocol')
+                self.on_change(params['change'])
+        if (message.get('method') == 'client-status-changed'
+                and message.get('params', {}).get('clientId') == self.owner
+                and message['params'].get('status') == 'disconnected'):
+            raise ConnectionError('Codex task owner disconnected')
+        return message
+
+    def request(self, method, params, target=None):
+        rid = str(uuid.uuid4())
+        message = {'type': 'request', 'requestId': rid, 'version': 1,
+                   'sourceClientId': self.client_id, 'method': method,
+                   'params': params, 'timeoutMs': 2500}
+        if target:
+            message['targetClientId'] = target
+        self.send(message)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            response = self.receive()
+            if response.get('requestId') == rid and response['type'] == 'response':
+                if response.get('resultType') != 'success':
+                    raise RuntimeError(response.get('error', 'Codex rejected settings'))
+                return response
+        raise TimeoutError('Codex settings request timed out')
+
+
+class Controller:
+    def __init__(self, target, changed, home=None, logger=lambda _: None, allowed=lambda: True,
+                 target_info=None):
+        self.target = target
+        self.changed = changed
+        self.allowed = allowed
+        self.target_info = target_info or (lambda: {'kind': 'desktop'})
+        self.target_key = None
+        self.kind = 'desktop'
+        self.home = Path(home or os.environ.get('CODEX_HOME', Path.home() / '.codex'))
+        self.catalog = ModelCatalog(self.home)
+        self.socket_path = os.environ.get('BUSYBAR_CODEX_IPC', str(self.home / 'ipc/ipc.sock'))
+        self.logger = logger
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.thread_id = None
+        self.state = {}
+        self.revision = None
+        self.pending = 0
+        self.due = 0
+        self.last_applied_at = 0
+        self.pending_since = 0
+        self.feedback_input_at = 0
+        self.confirmation_ms = None
+        self.display_ms = None
+        self.error = ''
+        self.feedback = None
+        self.feedback_revision = 0
+        self.feedback_until = 0
+        self.direction = 1
+        self.connected = False
+
+    def selection(self):
+        info = self.target_info()
+        target = info['thread_id'] if 'thread_id' in info else self.target()
+        return target, info, (target, info.get('kind'), info.get('socket'))
+
+    def status(self):
+        with self.lock:
+            model, effort = model_effort(self.state)
+            return {'enabled': True, 'connected': self.connected, 'thread_id': self.thread_id,
+                    'kind': self.kind,
+                    'model': model, 'effort': effort, 'error': self.error,
+                    'direction': self.direction,
+                    'confirmation_ms': self.confirmation_ms,
+                    'display_ms': self.display_ms,
+                    'feedback_revision': self.feedback_revision,
+                    'feedback': self.feedback if time.monotonic() < self.feedback_until else None}
+
+    def rotate(self, delta):
+        if not self.allowed():
+            return False
+        target, _, key = self.selection()
+        with self.lock:
+            if not target or target != self.thread_id or not self.connected:
+                return False
+            if self.target_key is not None and key != self.target_key:
+                return False
+            if not self.pending:
+                self.pending_since = time.monotonic()
+                # Leading-edge throttle: later detents never postpone a write.
+                self.due = max(self.pending_since, self.last_applied_at + STEP_INTERVAL_S)
+            self.pending = max(-32, min(32, self.pending + int(delta)))
+        self.wake.set()
+        return True
+
+    def mark_drawn(self, revision):
+        with self.lock:
+            if revision == self.feedback_revision and self.feedback_input_at:
+                self.display_ms = round((time.monotonic() - self.feedback_input_at) * 1000, 1)
+
+    def on_change(self, change):
+        with self.lock:
+            self.state, self.revision = apply_change(self.state, self.revision, change)
+            self.connected = True
+        self.changed()
+
+    def run(self, stop):
+        ipc = None
+        retry_at = 0
+        try:
+            while not stop.is_set():
+                self.wake.clear()
+                target, info, target_key = self.selection()
+                if target_key != self.target_key:
+                    if ipc:
+                        ipc.close()
+                        ipc = None
+                    with self.lock:
+                        self.thread_id = target
+                        self.target_key, self.kind = target_key, info.get('kind', 'desktop')
+                        self.state, self.revision, self.pending = {}, None, 0
+                        self.connected, self.feedback, self.error = False, None, ''
+                        self.confirmation_ms = self.display_ms = None
+                        self.last_applied_at = self.feedback_input_at = 0
+                    retry_at = 0
+                    self.changed()
+                if not target or time.monotonic() < retry_at:
+                    stop.wait(0.1)
+                    continue
+                delta = 0
+                requested_effort = None
+                try:
+                    if ipc is None:
+                        with self.lock:
+                            self.state, self.revision, self.connected = {}, None, False
+                        if info.get('kind') == 'cli':
+                            if info.get('native_control'):
+                                from codex_cli_native import NativeCLIIPC
+                                ipc = NativeCLIIPC(info['socket'], self.on_change)
+                            else:
+                                from codex_cli_client import CLIIPC
+                                ipc = CLIIPC(info['socket'], self.on_change)
+                        else:
+                            ipc = DesktopIPC(self.socket_path, self.on_change)
+                        ipc.connect(target)
+                        deadline = time.monotonic() + 3
+                        while self.revision is None and time.monotonic() < deadline:
+                            ipc.receive()
+                        if self.revision is None:
+                            raise TimeoutError('No Codex task snapshot')
+                        with self.lock:
+                            self.error = ''
+                    if hasattr(ipc, 'poll'):
+                        ipc.poll()
+                    readable = select.select([ipc.sock], [], [], 0)[0]
+                    if readable:
+                        ipc.receive()
+                    with self.lock:
+                        delta = self.pending if time.monotonic() >= self.due else 0
+                        input_at = self.pending_since
+                        if delta:
+                            self.pending = 0
+                        state = copy.deepcopy(self.state)
+                    if not delta or self.selection()[2] != target_key or not self.allowed():
+                        with self.lock:
+                            wait = min(.05, max(0, self.due - time.monotonic())) if self.pending else .05
+                        if not readable:
+                            self.wake.wait(wait)
+                        continue
+                    model, current = model_effort(state)
+                    levels = (ipc.levels_for(model) if hasattr(ipc, 'levels_for')
+                              else self.catalog.levels_for(model))
+                    if current not in levels:
+                        raise CatalogError(f'Current effort={current!r} absent from catalog '
+                                           f'for model={model!r}; levels={levels}')
+                    effort = levels[max(0, min(len(levels) - 1, levels.index(current) + delta))]
+                    requested_effort = effort
+                    if effort != current:
+                        ipc.request('thread-follower-update-thread-settings',
+                                    {'conversationId': target, 'threadSettings': effort_settings(state, effort)},
+                                    target=ipc.owner)
+                        deadline = time.monotonic() + 2
+                        while model_effort(self.state) != (model, effort) and time.monotonic() < deadline:
+                            ipc.receive()
+                        if model_effort(self.state) != (model, effort):
+                            raise ValueError('Codex did not confirm effort change')
+                    with self.lock:
+                        self.feedback = effort.upper()
+                        self.feedback_revision += 1
+                        self.direction = 1 if delta > 0 else -1
+                        self.last_applied_at = time.monotonic()
+                        self.feedback_until = self.last_applied_at + DURATION_S
+                        self.feedback_input_at = input_at
+                        self.confirmation_ms = round((self.last_applied_at - input_at) * 1000, 1)
+                        self.display_ms = None
+                        if self.pending:
+                            self.due = self.last_applied_at + STEP_INTERVAL_S
+                        self.error = ''
+                    self.logger(f'Codex effort: {target} -> {effort}')
+                    self.changed()
+                except CatalogError as error:
+                    # Keep the valid subscription and any newly queued dial steps.
+                    # A missing/partially rewritten shared cache is not an IPC error.
+                    with self.lock:
+                        self.confirmation_ms = self.display_ms = None
+                        self.error = str(error)
+                        self.feedback = 'ERR'
+                        self.feedback_revision += 1
+                        self.feedback_until = time.monotonic() + 2.5
+                    self.logger(f'Codex effort catalog: thread={target} {error}')
+                    self.changed()
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                    if ipc:
+                        ipc.close()
+                        ipc = None
+                    with self.lock:
+                        self.confirmation_ms = self.display_ms = None
+                        self.error = str(error)
+                        self.connected = False
+                        self.pending = 0
+                        self.feedback = 'ERR' if delta else None
+                        self.feedback_revision += 1
+                        self.feedback_until = time.monotonic() + 2.5
+                    self.logger(f'Codex effort unavailable: kind={self.kind} thread={target} '
+                                f'requested={requested_effort} {error}')
+                    self.changed()
+                    retry_at = time.monotonic() + 3
+        finally:
+            if ipc:
+                ipc.close()
