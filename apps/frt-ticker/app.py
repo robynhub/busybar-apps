@@ -9,7 +9,7 @@ Statistics are read from APNIC's daily BGP Routing Table Analysis (Thyme):
   * RPKI Valid / Unknown / Invalid counts
   * average AS-path length (including prepends)
   * top IPv4 and IPv6 origin ASes by number of announced prefixes
-  * worldwide IPv6 adoption (Google users accessing Google over IPv6)
+  * worldwide IPv6 adoption (APNIC Labs IPv6 Capable, 30-day average)
 
 Examples:
 
@@ -53,7 +53,7 @@ APNIC_V4_SUMMARY = APNIC_BASE + "/data-summary"
 APNIC_V6_SUMMARY = APNIC_BASE + "/ipv6-summary"
 APNIC_TOP_ORIGIN_V4 = APNIC_BASE + "/data-ASnet"
 APNIC_TOP_ORIGIN_V6 = APNIC_BASE + "/ipv6-asn-table"
-GOOGLE_IPV6_STATS = "https://www.google.com/intl/en/ipv6/statistics.html"
+APNIC_IPV6_ADOPTION = "https://data1.labs.apnic.net/v6stats/v6region/XA.json"
 
 # Decorative palette (native text colors are specified independently below).
 BLACK = (0, 0, 0)
@@ -200,7 +200,7 @@ def native_text(value, x, y, *, font="small", color=C_WHITE, align="top_left",
                 width=None, scroll_rate=None, scroll_start_delay=None,
                 scroll_repeat_delay=None):
     d = {
-	"id": "native_text",
+        "id": "native_text",
         "type": "text",
         "text": str(value),
         "x": x,
@@ -549,13 +549,26 @@ def render_scene_index(v: Visualizer, m: Metrics, index: int, t: float):
 # Lightweight APNIC/Thyme data source
 # ---------------------------------------------------------------------------
 
-def fetch_text(url: str, *, max_bytes=256_000, timeout=12, range_bytes=None):
+def fetch_text(url: str, *, max_bytes=256_000, timeout=12, range_bytes=None, debug=False, label=None):
     headers = {"User-Agent": "busybar-frt-ticker/0.2"}
     if range_bytes:
         headers["Range"] = f"bytes=0-{range_bytes - 1}"
+    tag = label or url
+    if debug:
+        extra = f" range=0-{range_bytes - 1}" if range_bytes else ""
+        print(f"[debug] download {tag}: GET {url}{extra}", flush=True)
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read(max_bytes).decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(max_bytes)
+            if debug:
+                status = getattr(r, "status", None) or r.getcode()
+                print(f"[debug] download {tag}: HTTP {status}, received {len(raw)} bytes", flush=True)
+            return raw.decode("utf-8", "replace")
+    except Exception as e:
+        if debug:
+            print(f"[debug] download {tag}: ERROR {type(e).__name__}: {e}", flush=True)
+        raise
 
 
 def _extract_int(text: str, label: str) -> int:
@@ -621,43 +634,71 @@ def parse_top_origin_v6(text: str):
     return None, None, ""
 
 
-def parse_ipv6_adoption(text: str) -> float:
-    """Return Google's latest worldwide Total IPv6 adoption percentage."""
-    # The public statistics page includes a label like:
-    #   Total IPv6: 47.99%
-    # Be permissive about whitespace / HTML between the label and number.
-    m = re.search(r"Total\s*IPv6\s*:?[^0-9]{0,80}([0-9]+(?:\.[0-9]+)?)\s*%",
-                  text, re.IGNORECASE | re.DOTALL)
-    if not m:
-        raise RuntimeError("Google IPv6 adoption field not found")
-    value = float(m.group(1))
-    if not 0.0 <= value <= 100.0:
-        raise RuntimeError(f"Google IPv6 adoption out of range: {value}")
+def parse_ipv6_adoption(text: str, debug=False) -> float:
+    """Return the latest APNIC Labs worldwide IPv6 Capable value.
+
+    APNIC publishes the World (XA) measurement as JSON.  Each dated record
+    contains smoothed intervals; use the 30-day ``capable_pc`` value, which
+    approximates a monthly worldwide IPv6-capability percentage.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        if debug:
+            print(f"[debug] ipv6-adoption: invalid JSON: {exc}", flush=True)
+            print(f"[debug] ipv6-adoption: response excerpt={text[:1000]!r}", flush=True)
+        raise RuntimeError("APNIC IPv6 adoption response is not valid JSON") from exc
+
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date = row.get("date", "")
+        interval = row.get("30", {})
+        if not isinstance(interval, dict):
+            continue
+        value = interval.get("capable_pc")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if date and 0.0 <= value <= 100.0:
+            candidates.append((date, value))
+
+    if debug:
+        print(f"[debug] ipv6-adoption: parsed {len(candidates)} JSON samples", flush=True)
+
+    if not candidates:
+        raise RuntimeError("APNIC worldwide IPv6 Capable rate not found in JSON")
+
+    date, value = max(candidates, key=lambda item: item[0])
+    if debug:
+        print(f"[debug] ipv6-adoption: newest sample {date} -> {value:.2f}%", flush=True)
     return value
 
 
-def fetch_live_metrics(progress=None):
+def fetch_live_metrics(progress=None, debug=False):
     if progress:
         progress("IPV4", 0)
-    v4 = parse_v4_summary(fetch_text(APNIC_V4_SUMMARY))
+    v4 = parse_v4_summary(fetch_text(APNIC_V4_SUMMARY, debug=debug, label="ipv4-summary"))
     if progress:
         progress("IPV6", 0)
-    v6 = parse_v6_summary(fetch_text(APNIC_V6_SUMMARY))
+    v6 = parse_v6_summary(fetch_text(APNIC_V6_SUMMARY, debug=debug, label="ipv6-summary"))
 
     if progress:
         progress("IPV6 ADOPTION", 0)
-    adoption = parse_ipv6_adoption(
-        fetch_text(GOOGLE_IPV6_STATS, max_bytes=512_000, timeout=12)
-    )
+    adoption_text = fetch_text(APNIC_IPV6_ADOPTION, max_bytes=6_000_000, timeout=20, debug=debug, label="ipv6-adoption")
+    adoption = parse_ipv6_adoption(adoption_text, debug=debug)
 
     # This endpoint is several MB in full, but it is sorted. Read only its first
     # 64 KiB; that contains the heading and the top rows. A Range header is sent
     # when supported, and read() is capped even if the server ignores Range.
     if progress:
         progress("TOP AS", 0)
-    top_chunk = fetch_text(APNIC_TOP_ORIGIN_V4, max_bytes=65_536, range_bytes=65_536)
+    top_chunk = fetch_text(APNIC_TOP_ORIGIN_V4, max_bytes=65_536, range_bytes=65_536, debug=debug, label="top-origin-v4")
     top_asn, top_pfx, top_name = parse_top_origin_v4(top_chunk)
-    top6_chunk = fetch_text(APNIC_TOP_ORIGIN_V6, max_bytes=16_384, range_bytes=16_384)
+    top6_chunk = fetch_text(APNIC_TOP_ORIGIN_V6, max_bytes=16_384, range_bytes=16_384, debug=debug, label="top-origin-v6")
     top6_asn, top6_pfx, top6_name = parse_top_origin_v6(top6_chunk)
 
     total = v4["prefixes"] + v6["prefixes"]
@@ -719,7 +760,8 @@ def load_cache(max_age_minutes=90):
 
 class LiveLoader:
     """Fetch fresh live data in the background; cache is fallback only."""
-    def __init__(self):
+    def __init__(self, debug=False):
+        self.debug = debug
         self.metrics = None
         self.cached_metrics = load_cache(max_age_minutes=24 * 60)
         self.error = None
@@ -757,7 +799,7 @@ class LiveLoader:
 
     def _run(self, initial):
         try:
-            fresh = fetch_live_metrics(self.progress)
+            fresh = fetch_live_metrics(self.progress, debug=self.debug)
             save_cache(fresh)
             with self._lock:
                 self.metrics = fresh
@@ -814,6 +856,7 @@ def parse_args():
                    help="decorative animation frames per second (default: 8)")
     p.add_argument("--autorefresh", type=float, default=60.0, metavar="MINUTES",
                    help="live-data refresh interval in minutes; 0 disables (default: 60)")
+    p.add_argument("--debug", action="store_true", help="print live-data fetch and parsing diagnostics")
     p.add_argument("--once", action="store_true", help="render one frame and exit")
     return p.parse_args()
 
@@ -829,7 +872,7 @@ def main():
     loader = None
     m = DEMO
     if not demo:
-        loader = LiveLoader()
+        loader = LiveLoader(debug=args.debug)
         loader.start()  # startup is always a fresh network fetch
 
     bb = Busy(args.host)
