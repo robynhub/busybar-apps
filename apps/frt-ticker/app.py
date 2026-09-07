@@ -687,7 +687,7 @@ def fetch_live_metrics(progress=None, debug=False):
     v6 = parse_v6_summary(fetch_text(APNIC_V6_SUMMARY, debug=debug, label="ipv6-summary"))
 
     if progress:
-        progress("IPV6 ADOPTION", 0)
+        progress("IPV6 ADOPT.", 0)
     adoption_text = fetch_text(APNIC_IPV6_ADOPTION, max_bytes=6_000_000, timeout=20, debug=debug, label="ipv6-adoption")
     adoption = parse_ipv6_adoption(adoption_text, debug=debug)
 
