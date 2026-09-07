@@ -1,0 +1,9 @@
+name: Lava Lamp
+author: robynhub
+description: A procedural lava lamp for BUSY Bar with flowing metaballs, surface tension, natural merging and splitting, and highly customizable motion and colors.
+tags:
+  - ambient
+  - animation
+  - lava-lamp
+  - pixel-art
+preview: ./preview.gif
